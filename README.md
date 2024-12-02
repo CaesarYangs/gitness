@@ -1,152 +1,134 @@
 # Harness
 Harness Open Source is an open source development platform packed with the power of code hosting, automated DevOps pipelines, hosted development environments (Gitspaces), and artifact registries.
 
-## Overview
-Harness Open source is an open source development platform packed with the power of code hosting, automated DevOps pipelines, Gitspaces, and artifact registries.
+## Reading & Reviewing
 
+**核心：Kingpin启动+dependency injection**
 
-## Running Harness locally
-> The latest publicly released docker image can be found on [harness/harness](https://hub.docker.com/r/harness/harness).
-
-To install Harness yourself, simply run the command below. Once the container is up, you can visit http://localhost:3000 in your browser.
-
-```bash
-docker run -d \
-  -p 3000:3000 \
-  -p 22:22 \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v /tmp/harness:/data \
-  --name harness \
-  --restart always \
-  harness/harness
 ```
-> The Harness image uses a volume to store the database and repositories. It is highly recommended to use a bind mount or named volume as otherwise all data will be lost once the container is stopped.
+migrate current [<envfile>]
+display the current version of the database
 
-See [developer.harness.io](https://developer.harness.io/docs/open-source) to learn how to get the most out of Harness.
+migrate to <version> [<envfile>]
+migrates the database to the provided version
 
-## Where is Drone?
+server [<flags>] [<envfile>]
+starts the server
 
-Harness Open Source represents a massive investment in the next generation of Drone. Where Drone focused solely on continuous integration, Harness adds source code hosting, developer environments (gitspaces), and artifact registries; providing teams with an end-to-end, open source DevOps platform.
+user self [<flags>]
+display authenticated user
 
-The goal is for Harness to eventually be at full parity with Drone in terms of pipeline capabilities, allowing users to seamlessly migrate from Drone to Harness.
+user pat [<flags>] <identifier> [<lifetime>]
+create personal access token
 
-But, we expect this to take some time, which is why we took a snapshot of Drone as a feature branch [drone](https://github.com/harness/harness/tree/drone) ([README](https://github.com/harness/harness/blob/drone/.github/readme.md)) so it can continue development.
+users find [<flags>] <id or email>
+display user details
 
-As for Harness, the development is taking place on the [main](https://github.com/harness/harness/tree/main) branch.
+users ls [<flags>]
+display a list of users
 
-For more information on Harness, please visit [developer.harness.io](https://developer.harness.io/).
+users create [<flags>] <email> [<admin>]
+create a user
 
-For more information on Drone, please visit [drone.io](https://www.drone.io/).
+users update [<flags>] <id or email>
+update a user
 
-## Harness Open Source Development
-### Pre-Requisites
+users delete <id or email>
+delete a user
 
-Install the latest stable version of Node and Go version 1.20 or higher, and then install the below Go programs. Ensure the GOPATH [bin directory](https://go.dev/doc/gopath_code#GOPATH) is added to your PATH.
+login [<server>]
+login to the remote server
 
-Install protobuf
-- Check if you've already installed protobuf ```protoc --version```
-- If your version is different than v3.21.11, run ```brew unlink protobuf```
-- Get v3.21.11 ```curl -s https://raw.githubusercontent.com/Homebrew/homebrew-core/9de8de7a533609ebfded833480c1f7c05a3448cb/Formula/protobuf.rb > /tmp/protobuf.rb```
-- Install it ```brew install /tmp/protobuf.rb```
-- Check out your version ```protoc --version```
+register [<server>]
+register a user
 
-Install protoc-gen-go and protoc-gen-go-rpc:
+logout
+logout from the remote server
 
-- Install protoc-gen-go v1.28.1 ```go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.28.1```
-(Note that this will install a binary in $GOBIN so make sure $GOBIN is in your $PATH)
+hooks pre-receive
+hook that is executed before any reference of the push is updated
 
-- Install protoc-gen-go-grpc v1.2.0 ```go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.2.0```
+hooks update <ref> <old> <new>
+hook that is executed before the specific reference gets updated
 
-```bash
-$ make dep
-$ make tools
+hooks post-receive
+hook that is executed after all references of the push got updated
 ```
 
-### Build
+## DB
 
-First step is to build the user interface artifacts:
+### sqlite3
 
-```bash
-$ pushd web
-$ yarn install
-$ yarn build
-$ popd
+每个service/requirement point都对应一套db interface，这套接口仅用于操作这个点内部的全部功能，和其他部分完全解耦
+
+## Cache
+
+### TTLCache design
+
+```go
+// Cache is an abstraction of a simple cache.
+type Cache[K any, V any] interface {
+	Stats() (int64, int64)
+	Get(ctx context.Context, key K) (V, error)
+}
 ```
 
-After that, you can build the Harness binary:
-
-```bash
-$ make build
+```go
+func New(
+	pathStore store.SpacePathStore,
+	spacePathTransformation store.SpacePathTransformation,
+) store.SpacePathCache {
+	return &pathCache{
+		inner: cache.New[string, *types.SpacePath](
+			&pathCacheGetter{
+				spacePathStore: pathStore,
+			},
+			1*time.Minute),
+		spacePathTransformation: spacePathTransformation,
+	}
+}
 ```
 
-### Run
-
-This project supports all operating systems and architectures supported by Go.  This means you can build and run the system on your machine; docker containers are not required for local development and testing.
-
-To start the server at `localhost:3000`, simply run the following command:
-
-```bash
-./gitness server .local.env
+```go
+type TTLCache[K comparable, V any] struct {
+	mx        sync.RWMutex
+	cache     map[K]cacheEntry[V]
+	purgeStop chan struct{}
+	getter    Getter[K, V]
+	maxAge    time.Duration
+	countHit  int64
+	countMiss int64
+}
 ```
 
-### Auto-Generate Harness API Client used by UI using Swagger
-Please make sure to update the autogenerated client code used by the UI when adding new rest APIs.
+缓存去重操作：惰性判断复制+缩减长度，完全原地操作
+```go
+// Deduplicate is a utility function that removes duplicates from slice.
+func Deduplicate[V constraints.Ordered](slice []V) []V {
+	if len(slice) <= 1 {
+		return slice
+	}
 
-To regenerate the code, please execute the following steps:
-- Regenerate swagger with latest Harness binary `./gitness swagger > web/src/services/code/swagger.yaml`
-- navigate to the `web` folder and run `yarn services`
+	sort.Slice(slice, func(i, j int) bool { return slice[i] < slice[j] })
 
-The latest API changes should now be reflected in `web/src/services/code/index.tsx`
+	pointer := 0
+	for i := 1; i < len(slice); i++ {
+		if slice[pointer] != slice[i] {
+			pointer++
+			slice[pointer] = slice[i]
+		}
+	}
 
-# Run Registry Conformance Tests
-```
-make conformance-test
-```
-For running conformance tests with existing running service, use:
-```
-make hot-conformance-test
-```
-
-## User Interface
-
-This project includes a full user interface for interacting with the system. When you run the application, you can access the user interface by navigating to `http://localhost:3000` in your browser.
-
-## REST API
-
-This project includes a swagger specification. When you run the application, you can access the swagger specification by navigating to `http://localhost:3000/swagger` in your browser (for raw yaml see `http://localhost:3000/openapi.yaml`).
-For registry endpoints, currently swagger is located on different endpoint `http://localhost:3000/registry/swagger/` (for raw json see `http://localhost:3000/registry/swagger.json`). These will be later moved to the main swagger endpoint. 
-
-
-For testing, it's simplest to just use the cli to create a token (this requires Harness server to run):
-```bash
-# LOGIN (user: admin, pw: changeit)
-$ ./gitness login
-
-# GENERATE PAT (1 YEAR VALIDITY)
-$ ./gitness user pat "my-pat-uid" 2592000
+	return slice[:pointer+1]
+}
 ```
 
-The command outputs a valid PAT that has been granted full access as the user.
-The token can then be send as part of the `Authorization` header with Postman or curl:
+## Side dishes
 
-```bash
-$ curl http://localhost:3000/api/v1/user \
--H "Authorization: Bearer $TOKEN"
+**优雅处理系统停止信号，终止上下文**
+
+```go
+ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+defer stop()
 ```
 
-
-## CLI
-This project includes VERY basic command line tools for development and running the service. Please remember that you must start the server before you can execute commands.
-
-For a full list of supported operations, please see
-```bash
-$ ./gitness --help
-```
-
-## Contributing
-
-Refer to [CONTRIBUTING.md](https://github.com/harness/harness/blob/main/CONTRIBUTING.md)
-
-## License
-
-Apache License 2.0, see [LICENSE](https://github.com/harness/harness/blob/main/LICENSE).

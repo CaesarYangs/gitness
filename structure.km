@@ -1,0 +1,60 @@
+{
+    "root": {
+        "data": {
+            "id": "d613cagda0o0",
+            "created": 1733130087003,
+            "text": "Gitness"
+        },
+        "children": [
+            {
+                "data": {
+                    "id": "d613cg6ywtc0",
+                    "created": 1733130099496,
+                    "text": "Storage",
+                    "layout": null
+                },
+                "children": []
+            },
+            {
+                "data": {
+                    "id": "d613cl9jd8g0",
+                    "created": 1733130110535,
+                    "text": "Cache",
+                    "layout": null
+                },
+                "children": [
+                    {
+                        "data": {
+                            "id": "d613cmch1wg0",
+                            "created": 1733130112889,
+                            "text": "redis",
+                            "layout": null
+                        },
+                        "children": []
+                    },
+                    {
+                        "data": {
+                            "id": "d613cniwbig0",
+                            "created": 1733130115454,
+                            "text": "nocache",
+                            "layout": null
+                        },
+                        "children": []
+                    },
+                    {
+                        "data": {
+                            "id": "d613cp9wrp40",
+                            "created": 1733130119265,
+                            "text": "TTLCache",
+                            "layout": null
+                        },
+                        "children": []
+                    }
+                ]
+            }
+        ]
+    },
+    "template": "right",
+    "theme": "fresh-blue",
+    "version": "1.4.43"
+}
