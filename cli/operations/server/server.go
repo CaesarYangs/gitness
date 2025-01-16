@@ -84,6 +84,7 @@ func (c *command) run(*kingpin.ParseContext) error {
 	// - ctx is canceled
 	g, gCtx := errgroup.WithContext(ctx)
 
+	// 此部分都是定时任务
 	g.Go(func() error {
 		// initialize metric collector
 		if system.services.MetricCollector != nil {
