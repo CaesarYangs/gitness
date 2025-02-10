@@ -267,3 +267,231 @@ buildUser(&reflector)
 - 账户信息这一部分
 - Session部分同样用到了和staticbackend中类似的session串机制,通过一套pipe操作,能够高效地处理对于一个session的权限,细节等内容的添加和修改
 
+### appRouter
+这部分内容都与Registry的创建，存储等操作的路由相关，属于app用户创建相关功能的路由。
+
+core code:
+- 在初始化过程中还可以直接附带上要使用的全部middleware
+- 核心是使用了Chi这个Golang web路由框架
+
+
+```go
+func GetAppRouter(
+	ociHandler oci.RegistryOCIHandler,
+	appHandler harness.APIHandler,
+	baseURL string,
+) AppRouter {
+	r := chi.NewRouter()
+	r.Use(hlog.URLHandler("http.url"))
+	r.Use(hlog.MethodHandler("http.method"))
+	r.Use(logging.HLogRequestIDHandler())
+	r.Use(logging.HLogAccessLogHandler())
+	r.Use(address.Handler("", ""))
+
+	r.Group(func(r chi.Router) {
+		r.Handle(fmt.Sprintf("%s/*", baseURL), appHandler)
+		r.Handle("/v2/*", ociHandler)
+
+		r.Handle("/registry/swagger*", swagger.GetSwaggerHandler("/registry"))
+	})
+	return r
+}
+```
+
+内部真正的router核心是APIHandler
+
+可以看到几乎所有的函数和模块设计都用到了依赖注入的思想，每一层都不会依赖其他层的真实实现。
+- 这里的apiController可以看作是一个单例的manager角色
+- APIController就是实现了更上层StrictServerInterface这个app(artifact,registry)相关内容管理的接口，因此全部的实现代码都可以从controller目录内找到
+
+```go
+func NewAPIHandler(
+	repoDao store.RegistryRepository,
+	upstreamproxyDao store.UpstreamProxyConfigRepository,
+	tagDao store.TagRepository,
+	manifestDao store.ManifestRepository,
+	cleanupPolicyDao store.CleanupPolicyRepository,
+	imageDao store.ImageRepository,
+	driver storagedriver.StorageDriver,
+	baseURL string,
+	spaceStore corestore.SpaceStore,
+	tx dbtx.Transactor,
+	authenticator authn.Authenticator,
+	urlProvider urlprovider.Provider,
+	authorizer authz.Authorizer,
+	auditService audit.Service,
+	spacePathStore corestore.SpacePathStore,
+) APIHandler {
+	r := chi.NewRouter()
+	r.Use(audit.Middleware())
+	r.Use(middlewareauthn.Attempt(authenticator))
+	r.Use(middleware.CheckAuth())
+	apiController := metadata.NewAPIController(
+		repoDao,
+		upstreamproxyDao,
+		tagDao,
+		manifestDao,
+		cleanupPolicyDao,
+		imageDao,
+		driver,
+		spaceStore,
+		tx,
+		urlProvider,
+		authorizer,
+		auditService,
+		spacePathStore,
+	)
+	handler := artifact.NewStrictHandler(apiController, []artifact.StrictMiddlewareFunc{})
+	muxHandler := artifact.HandlerFromMuxWithBaseURL(handler, r, baseURL)
+	return encode.TerminatedPathBefore(
+		terminatedPathPrefixesAPI,
+		encode.TerminatedRegexPathBefore(terminatedPathRegexPrefixesAPI, muxHandler),
+	)
+}
+```
+
+- 从而这个部分的controller依旧是单例的manager结构，直接从NewStrictHandler传递到了最终将要实现操作管理的strictHandler这个类
+- 再往下深入就可以按照每一个业务函数的代码流程进行梳理了
+- 现在可以发现同时有两个结构体都实现了全部的StrictServerInterface接口
+  - strictHandler
+  - APIController
+
+***他们的关系是什么？为什么要都实现一遍？***
+- 继续思考代码结构就能发现，他们是将同一个interface实现了两遍，但是有不同的逻辑层次结构
+  - strictHandler属于最上层，由外部直接调用的函数，包含了解包，执行，组包和上下文以及错误管理等middleware的更加系统完整的结构
+  - APIController属于专注在业务逻辑，每个实现的函数都是满足业务流程的最小单元，在方便区分的同时鲁棒性更强，也更便于测试发现问题
+  - 并且在APIController的实现过程中，将controller作为每个函数一个go文件的布局，文件名就是函数名，极大的简化了目录结构
+
+**以CreateRegistry为例就能看出其中的特性**
+
+**Upper-level**
+
+主要是涉及到中间件的处理流程，函数中也会将真实的调用与处理过程用匿名函数包装成一个小handler，以流程化的middleware pipeline处理
+
+```go
+func (sh *strictHandler) CreateRegistry(w http.ResponseWriter, r *http.Request, params CreateRegistryParams) {
+	var request CreateRegistryRequestObject
+
+	request.Params = params
+
+	var body CreateRegistryJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.CreateRegistry(ctx, request.(CreateRegistryRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "CreateRegistry")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(CreateRegistryResponseObject); ok {
+		if err := validResponse.VisitCreateRegistryResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+```
+
+**Lower-level**
+
+主要是真实的业务流程代码，解开请求，与数据库相关，并会判断是virtual的还是会真实落盘，有相应的处理流程
+
+```go
+func (c *APIController) CreateRegistry(
+	ctx context.Context,
+	r artifact.CreateRegistryRequestObject,
+) (artifact.CreateRegistryResponseObject, error) {
+	registryRequest := artifact.RegistryRequest(*r.Body)
+	parentRef := artifact.SpaceRefPathParam(*registryRequest.ParentRef)
+
+	regInfo, err := c.GetRegistryRequestBaseInfo(ctx, string(parentRef), "")
+	if err != nil {
+		return artifact.CreateRegistry400JSONResponse{
+			BadRequestJSONResponse: artifact.BadRequestJSONResponse(
+				*GetErrorResponse(http.StatusBadRequest, err.Error()),
+			),
+		}, err
+	}
+
+	space, err := c.SpaceStore.FindByRef(ctx, regInfo.ParentRef)
+	if err != nil {
+		return artifact.CreateRegistry400JSONResponse{
+			BadRequestJSONResponse: artifact.BadRequestJSONResponse(
+				*GetErrorResponse(http.StatusBadRequest, err.Error()),
+			),
+		}, err
+	}
+
+	session, _ := request.AuthSessionFrom(ctx)
+	if err = apiauth.CheckSpaceScope(
+		ctx,
+		c.Authorizer,
+		session,
+		space,
+		gitnessenum.ResourceTypeRegistry,
+		gitnessenum.PermissionRegistryEdit,
+	); err != nil {
+		return artifact.CreateRegistry403JSONResponse{
+			UnauthorizedJSONResponse: artifact.UnauthorizedJSONResponse(
+				*GetErrorResponse(http.StatusForbidden, err.Error()),
+			),
+		}, err
+	}
+
+	if registryRequest.Config.Type == artifact.RegistryTypeVIRTUAL {
+		return c.createVirtualRegistry(ctx, registryRequest, regInfo, session, parentRef)
+	}
+	registry, upstreamproxy, err := c.CreateUpstreamProxyEntity(
+		ctx,
+		registryRequest,
+		regInfo.parentID, regInfo.rootIdentifierID,
+	)
+	var registryID int64
+	if err != nil {
+		return throwCreateRegistry400Error(err), err
+	}
+
+	err = c.tx.WithTx(
+		ctx, func(ctx context.Context) error {
+			registryID, err = c.createRegistryWithAudit(ctx, registry, session.Principal, string(parentRef))
+
+			if err != nil {
+				return fmt.Errorf("failed to create registry: %w", err)
+			}
+
+			upstreamproxy.RegistryID = registryID
+
+			_, err = c.createUpstreamProxyWithAudit(
+				ctx, upstreamproxy, session.Principal, string(parentRef), registry.Name,
+			)
+
+			if err != nil {
+				return fmt.Errorf("failed to create upstream proxy: %w", err)
+			}
+			return nil
+		},
+	)
+
+	if err != nil {
+		return throwCreateRegistry400Error(err), err
+	}
+	upstreamproxyEntity, err := c.UpstreamProxyStore.Get(ctx, registryID)
+	if err != nil {
+		return throwCreateRegistry400Error(err), err
+	}
+
+	return artifact.CreateRegistry201JSONResponse{
+		RegistryResponseJSONResponse: *CreateUpstreamProxyResponseJSONResponse(upstreamproxyEntity),
+	}, nil
+}
+```
